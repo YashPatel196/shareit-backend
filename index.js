@@ -4,6 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const archiver = require('archiver');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -23,12 +24,35 @@ if (!fs.existsSync(uploadDir)) {
 }
 
 // Setup storage engine
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
-});
-
+// const storage = multer.diskStorage({
+//     destination: (req, file, cb) => cb(null, 'uploads/'),
+//     filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+// });
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
+
+const ALGORITHM = 'aes-256-cbc';
+
+// Helper to encrypt a buffer
+function encrypt(buffer, password) {
+    const salt = crypto.randomBytes(16);
+    const key = crypto.scryptSync(password, salt, 32);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+    const result = Buffer.concat([salt, iv, cipher.update(buffer), cipher.final()]);
+    return result;
+}
+
+// Helper to decrypt a buffer
+function decrypt(buffer, password) {
+    const salt = buffer.slice(0, 16);
+    const iv = buffer.slice(16, 32);
+    const encryptedData = buffer.slice(32);
+    const key = crypto.scryptSync(password, salt, 32);
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+    const result = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    return result;
+}
 
 // Database to store keys and file paths
 let fileDatabase = {};
@@ -39,36 +63,51 @@ app.post('/upload', upload.array('files'), (req, res) => {
     
     const key = Math.floor(100000 + Math.random() * 900000).toString();
     
-    fileDatabase[key] = req.files.map(file => ({
-        path: file.path,
-        name: file.originalname
-    }));
+    fileDatabase[key] = req.files.map(file => {
+        const encryptedBuffer = encrypt(file.buffer, key);
+        const fileName = Date.now() + '-' + file.originalname + '.enc';
+        const filePath = path.join(uploadDir, fileName);
+        
+        fs.writeFileSync(filePath, encryptedBuffer);
+        
+        return {
+            path: filePath,
+            name: file.originalname
+        };
+    });
     
-    console.log(`${req.files.length} files stored with key: ${key}`);
     res.json({ key, count: req.files.length });
 });
 
 // API to Download
 app.get('/download/:key', (req, res) => {
-    const files = fileDatabase[req.params.key];
-    if (!files || files.length === 0) return res.status(404).send("Invalid or expired key.");
+    const key = req.params.key;
+    const files = fileDatabase[key];
+    if (!files) return res.status(404).send("Invalid or expired key.");
 
     const fileIndex = req.query.index;
 
+    // Single File Download
     if (fileIndex !== undefined) {
         const file = files[parseInt(fileIndex)];
         if (!file) return res.status(404).send("File not found.");
-        return res.download(file.path, file.name);
+        
+        const encryptedBuffer = fs.readFileSync(file.path);
+        const decryptedBuffer = decrypt(encryptedBuffer, key);
+        
+        res.setHeader('Content-Disposition', `attachment; filename=${file.name}`);
+        return res.send(decryptedBuffer);
     }
 
+    // ZIP Download
     const archive = archiver('zip', { zlib: { level: 9 } });
-    res.attachment(`ShareIt-${req.params.key}.zip`);
-    
-    archive.on('error', (err) => res.status(500).send({ error: err.message }));
+    res.attachment(`ShareIt-${key}.zip`);
     archive.pipe(res);
 
     files.forEach(file => {
-        archive.file(file.path, { name: file.name });
+        const encryptedBuffer = fs.readFileSync(file.path);
+        const decryptedBuffer = decrypt(encryptedBuffer, key);
+        archive.append(decryptedBuffer, { name: file.name });
     });
 
     archive.finalize();
